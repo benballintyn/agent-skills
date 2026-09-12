@@ -16,6 +16,7 @@ same layout.
 | `new-project` | Scaffold a Python project to house standards |
 | `preflight` | Pre-build validation: prior art, approaches, acceptance criteria |
 | `release-vox` | Release workflow for the vox library |
+| `review-loop` | Severity contract, triage and round cap for reviewer rounds on a PR |
 
 Install on a new machine — link both platforms:
 
@@ -28,6 +29,9 @@ for d in ~/.agents/skills/*/; do
   ln -sfn "$d" ~/.codex/skills/"$name"
 done
 ```
+
+`agents/reviewer.md` is the `reviewer` subagent definition, symlinked from
+`~/.claude/agents/reviewer.md`; the `review-loop` skill is its author-side half.
 
 `~/.agents/AGENTS.md` is the shared instruction file (`~/.codex/AGENTS.md`
 symlinks to it, and `~/.claude/CLAUDE.md` imports it). It pulls in
