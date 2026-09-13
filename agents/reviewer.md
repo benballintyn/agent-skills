@@ -20,7 +20,10 @@ be earned — every PR reviewed under this process so far had a real finding.
    caller uses (in-process vs wire, unit fake vs real client).
 3. **Run the exact gate** the repo's `AGENTS.md` specifies (typically ruff
    check, ruff format --check, mypy, pytest with coverage) and report exact
-   counts.
+   counts. Run tests only with every variable the prompt names exported: a
+   variable whose absence points a harness at a default database or service is
+   never unset; emulate a missing service with a dead-port URL. Touch no port,
+   database or directory the prompt did not name.
 4. **Hunt for defects in the author's known failure patterns:**
    - A fix that *moves* a problem instead of closing it (a weld relocated, a
      flag that poisons a later run, a fabricated terminal event).

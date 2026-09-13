@@ -76,7 +76,10 @@ commit did about each item, in the reviewer's own numbering; your known
 failure patterns; **what severity means** (paste the contract above); and for a
 delta round, "verify the fix and the previous findings; new mutants only on
 the changed lines". Ask what would make your assumptions false. Ask for the
-verdict line first.
+verdict line first. Name every live resource the reviewer may touch (the test database URL and
+port) and say that emulating a missing variable means pointing it at a dead port,
+never unsetting it: a harness whose default URL is the developer's own database runs
+against it the moment the variable is gone.
 
 ## Signals that the code, not the review, is the problem
 
