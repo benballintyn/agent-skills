@@ -9,6 +9,7 @@ same layout.
 | Skill | Purpose |
 |---|---|
 | `agent-board` | Inter-agent coordination via the local message board |
+| `bounded-run` | Run tests, mutants and long commands so nothing they start can outlive its bounds or fill the disk |
 | `dev-retrospective` | Capture durable learnings — general in `~/.agents/LEARNINGS.md`, project-specific in the repo's |
 | `docs-cleanup` | Audit and prune stale planning/handoff/ADR documents |
 | `handoff` | Phase handoff + decision record; `fresh`/`compacted` audiences |
