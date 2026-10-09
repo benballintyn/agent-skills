@@ -85,6 +85,8 @@ LOG_RETENTION_S = 7 * 24 * 3600
 ENV_RUN_ID = "BOUNDED_RUN_ID"
 ENV_OWNER = "BOUNDED_RUN_OWNER"
 RUN_ID = re.compile(r"\A\d{8}T\d{6}-[0-9a-f]{8}\Z")
+# ASCII digits only: str.isdigit() also accepts "²" and "①", which int() refuses.
+INTEGER = re.compile(r"-?[0-9]+")
 DEFAULT_REGISTRY = Path(os.environ.get("BOUNDED_RUN_REGISTRY", Path(tempfile.gettempdir()) / "bounded-run"))
 # Every signal the watchdog can ignore: all but SIGKILL and SIGSTOP (which cannot be
 # caught) and SIGCHLD (left as it is).
@@ -191,7 +193,9 @@ def ps_lines(fields: str) -> list[str]:
     """
     # restore_signals=False: the watchdog ignores SIGXFSZ and SIGPIPE, and so must
     # its ps, or one sent to the group kills ps and the watchdog fails closed.
-    return subprocess.run(["ps", "-A", "-o", fields], capture_output=True, text=True,
+    # errors="replace": ps prints a non-UTF-8 byte in any process's command line raw,
+    # and strict decoding would let that one process crash every reader.
+    return subprocess.run(["ps", "-A", "-o", fields], capture_output=True, text=True, errors="replace",
                           check=True, restore_signals=False).stdout.split("\n")
 
 
@@ -210,7 +214,7 @@ def numeric(fields: list[str], count: int) -> bool:
     Returns:
         True when the line can be read.
     """
-    return len(fields) > count and all(field.lstrip("-").isdigit() for field in fields[:count])
+    return len(fields) > count and all(INTEGER.fullmatch(field) for field in fields[:count])
 
 
 def group_members(pgid: int) -> dict[int, str]:
@@ -240,7 +244,7 @@ def leader_start(pid: int) -> str:
         The ``lstart`` string.
     """
     out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                         restore_signals=False)
+                         errors="replace", restore_signals=False)
     return out.stdout.strip()
 
 
@@ -267,7 +271,7 @@ def tagged_processes(run_id: str) -> list[int]:
                         found.append(int(entry.name))
     else:
         listing = subprocess.run(["ps", "-E", "-A", "-o", "pid=,stat=,command="], capture_output=True,
-                                 text=True, restore_signals=False).stdout
+                                 text=True, errors="replace", restore_signals=False).stdout
         pattern = re.compile(rf"(^|\s){re.escape(tag)}(\s|$)")
         for line in listing.split("\n"):
             fields = line.split(None, 2)
