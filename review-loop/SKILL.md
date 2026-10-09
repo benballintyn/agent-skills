@@ -46,6 +46,15 @@ outcome today, it is a NIT. The reviewer must say which of the two it is.
 4. Past three rounds without a BLOCKER, stop and ask the owner whether the
    remaining items are worth a round or a follow-up issue.
 
+## Processes and disk
+
+Author and reviewer run every test suite and mutant through the `bounded-run`
+skill's `bounded_run.py`, with at most 2 parallel workers, and run its `--check`
+before reporting. A reported "hang", "timeout" or "indeterminate (hang)" is a
+process to account for, so ask whether it is still running before filing it as
+a test note (2026-10-09: three such hangs became a 42-hour orphan that filled
+the owner's disk).
+
 ## What the author does with a verdict
 
 - Read every finding, then **triage before touching code**: BLOCKER and
