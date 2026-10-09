@@ -398,6 +398,87 @@ def test_the_watchdog_kills_an_escapee_after_the_runner_is_killed(tmp_path: Path
         kill_quietly(pgids=(runner.pid, *read_pids(pid_file)), pids=tuple(read_pids(pid_file)))
 
 
+def test_ps_lines_that_do_not_start_with_a_pid_are_skipped_not_parsed(mocker) -> None:
+    """A process whose command line spills onto further ``ps`` lines (seen in review: a
+    multi-line shell command crashed the runner after its command ended) is read past by
+    every reader: group members, the process table, and the run-tag sweep."""
+    listing = (
+        "  101   101 S    python worker\n"
+        "\u00b2 \u2462 spilled line whose first two tokens isdigit() accepts and int() refuses\n"
+        "  103   101 S    a command with \u2028 and \r inside it\n"
+        "second line of someone's multi-line command BOUNDED_RUN_ID=run-x\n"
+        "  102   101 S    sleep 9 BOUNDED_RUN_ID=run-x\n"
+        "\n"
+    )
+    lstart = (
+        "  101     1   101 S    Thu Oct  9 10:00:00 2026\n"
+        "spilled text 1 2 3 4\n"
+        "  102   101   101 S    Thu Oct  9 10:00:01 2026\n"
+    )
+
+    def fake_run(args, **kwargs):
+        text = lstart if "lstart=" in args[-1] else listing
+        return subprocess.CompletedProcess(args, 0, stdout=text, stderr="")
+
+    mocker.patch.object(bounded_run.subprocess, "run", side_effect=fake_run)
+    mocker.patch.object(bounded_run.Path, "is_dir", return_value=False)  # take the ps -E route
+
+    assert bounded_run.group_members(101) == {
+        101: "python worker",
+        102: "sleep 9 BOUNDED_RUN_ID=run-x",
+        103: "a command with \u2028 and \r inside it",  # one line: split on "\n" only
+    }
+    assert bounded_run.process_table() == {101: (1, 101, "Thu Oct  9 10:00:00 2026"),
+                                            102: (101, 101, "Thu Oct  9 10:00:01 2026")}
+    assert bounded_run.tagged_processes("run-x") == [102]
+
+
+def test_a_failure_after_the_command_ends_still_stops_its_group(tmp_path: Path, mocker) -> None:
+    """Whatever breaks while the runner reports (here: reading the disk marker, its first step
+    after the command ends, before it stops the group), the group is stopped before the error
+    propagates, so a straggler the command left behind does not outlive it."""
+    pid_file = tmp_path / "pid"
+    real_exists = Path.exists
+
+    def exists(path: Path) -> bool:
+        if path.name.endswith(".disk"):
+            raise RuntimeError("sweep failed")
+        return real_exists(path)
+
+    mocker.patch.object(bounded_run.Path, "exists", autospec=True, side_effect=exists)
+    limits = bounded_run.Limits(wall_s=20, cpu_s=40, max_file_bytes=1 << 20, min_free_gb=0, abort_free_gb=0)
+    script = tmp_path / "leave_one.sh"
+    script.write_text(f"sleep 30 &\necho $! > {pid_file}\nexit 0\n")
+    try:
+        with pytest.raises(RuntimeError, match="sweep failed"):
+            bounded_run.run(limits, ["bash", str(script)], tmp_path / "reg", None, tail_kb=1, owner="tests")
+
+        assert not alive(read_pids(pid_file)[0]), "the straggler outlived the failed report"
+    finally:
+        groups = [json.loads(p.read_text())["pid"] for p in (tmp_path / "reg").glob("*.json")]
+        kill_quietly(pgids=tuple(groups), pids=tuple(read_pids(pid_file)))
+
+
+def test_a_process_with_a_non_utf8_byte_in_its_command_line_breaks_nothing(tmp_path: Path) -> None:
+    """macOS ps prints such bytes raw; strict decoding let that one process crash the runner
+    and --check. Real process, real ps."""
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", os.fsdecode(b"\xff\xfe")],
+                             start_new_session=True)
+    try:
+        result = run_tool("--wall", "20", "--", "sleep", "1", registry=tmp_path)
+        check = subprocess.run([sys.executable, str(SCRIPT), "--registry", str(tmp_path), "--check"],
+                               capture_output=True, text=True, timeout=30, env=env())
+        members = bounded_run.group_members(other.pid)
+        swept = bounded_run.tagged_processes("no-such-run")
+    finally:
+        kill_quietly(pgids=(other.pid,))
+
+    assert result.returncode == 0 and "exited; status 0" in result.stderr, result.stderr
+    assert check.returncode == 0 and "no live runs" in check.stdout, check.stderr
+    assert other.pid in members
+    assert swept == []
+
+
 # --- kernel limits -----------------------------------------------------------------------
 
 
