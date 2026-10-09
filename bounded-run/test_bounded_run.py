@@ -284,7 +284,7 @@ def test_a_term_ignoring_command_dies_when_the_runner_is_terminated_then_killed_
 def test_a_command_that_signals_its_own_group_cannot_disarm_the_watchdog(tmp_path: Path) -> None:
     """Every catchable signal the command sends its own group reaches the watchdog, which ignores it."""
     pid_file = tmp_path / "pid"
-    signals = "INT TERM HUP QUIT USR1 USR2 ALRM PROF VTALRM XCPU ABRT TSTP TTIN TTOU"
+    signals = "INT TERM HUP QUIT USR1 USR2 ALRM PROF VTALRM XCPU ABRT TSTP TTIN TTOU XFSZ PIPE"
     sends = "; ".join(f"kill -{name} 0" for name in signals.split())
     script = (f"trap '' {signals}; echo $$ > {pid_file}; {sends}; "
               "for i in $(seq 1 300); do sleep 0.2; done")

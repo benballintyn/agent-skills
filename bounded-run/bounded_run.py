@@ -189,8 +189,10 @@ def ps_lines(fields: str) -> list[str]:
     Returns:
         One line per process.
     """
+    # restore_signals=False: the watchdog ignores SIGXFSZ and SIGPIPE, and so must
+    # its ps, or one sent to the group kills ps and the watchdog fails closed.
     return subprocess.run(["ps", "-A", "-o", fields], capture_output=True, text=True,
-                          check=True).stdout.splitlines()
+                          check=True, restore_signals=False).stdout.splitlines()
 
 
 def group_members(pgid: int) -> dict[int, str]:
@@ -219,7 +221,8 @@ def leader_start(pid: int) -> str:
     Returns:
         The ``lstart`` string.
     """
-    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                         restore_signals=False)
     return out.stdout.strip()
 
 
@@ -246,7 +249,7 @@ def tagged_processes(run_id: str) -> list[int]:
                         found.append(int(entry.name))
     else:
         listing = subprocess.run(["ps", "-E", "-A", "-o", "pid=,stat=,command="], capture_output=True,
-                                 text=True).stdout
+                                 text=True, restore_signals=False).stdout
         pattern = re.compile(rf"(^|\s){re.escape(tag)}(\s|$)")
         for line in listing.splitlines():
             fields = line.split(None, 2)
@@ -606,7 +609,7 @@ def check(registry: Path, owner: str, everyone: bool) -> int:
 
     Only the caller's own runs are considered unless ``everyone`` is set. A record
     whose run has nothing left alive (its runner was killed, and the watchdog did
-    its job) is removed, if it is the caller's.
+    its job) is removed, with its marker files, only if it is the caller's.
 
     Args:
         registry: The registry directory.
@@ -634,7 +637,7 @@ def check(registry: Path, owner: str, everyone: bool) -> int:
             print(f"LIVE{overdue} {record.run_id} owner={record.owner!r} pgid={record.pid} "
                   f"members={sorted(set(members) | set(tagged))} cmd={' '.join(record.command)[:120]!r} "
                   f"log={record.log}")
-        elif record.owner == owner or everyone:
+        elif record.owner == owner:
             for stale in (path, path.with_suffix(".stopping"), path.with_suffix(".disk")):
                 stale.unlink(missing_ok=True)
     if not alive:
