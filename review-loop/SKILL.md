@@ -49,8 +49,9 @@ outcome today, it is a NIT. The reviewer must say which of the two it is.
 ## Processes and disk
 
 Author and reviewer run every test suite and mutant through the `bounded-run`
-skill's `bounded_run.py`, with at most 2 parallel workers, and run its `--check`
-before reporting. A reported "hang", "timeout" or "indeterminate (hang)" is a
+skill's `bounded_run.py` (each with its own `BOUNDED_RUN_OWNER`), with at most 2
+parallel workers, and run its `--check` before reporting; the coordinator runs
+`--check --all` after each agent stops. A reported "hang", "timeout" or "indeterminate (hang)" is a
 process to account for, so ask whether it is still running before filing it as
 a test note (2026-10-09: three such hangs became a 42-hour orphan that filled
 the owner's disk).

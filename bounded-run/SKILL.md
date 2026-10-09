@@ -13,35 +13,54 @@ The rule against this ("kill the process group") was already in the learnings fi
 
 ## The rule
 
-**Run every test suite, mutant, benchmark, build or long command through `bounded_run.py`.** Never write your own runner around `subprocess.run(timeout=…)`: that timeout kills one process, not what it started.
+**Run every test suite, mutant, benchmark, build or long command through `bounded_run.py`,** with `BOUNDED_RUN_OWNER` set to something unique to you (your scratch directory works). Never write your own runner around `subprocess.run(timeout=…)`: that timeout kills one process, not what it started.
 
 ```bash
+export BOUNDED_RUN_OWNER=/private/tmp/my-scratch
 python3 ~/.agents/skills/bounded-run/bounded_run.py --wall 600 -- uv run pytest -q
 ```
 
-Each command is bounded four independent ways:
+## What bounds a command
 
 | Bound | What it stops | Holds if the runner is killed? |
 |---|---|---|
 | Its own process group, killed as a unit on deadline, exit, SIGTERM/INT/HUP | grandchildren outliving the run | no (that is what the next rows are for) |
-| A watchdog inside the group that kills it at the deadline (+11 s slack) | the incident: the runner gone, the group still looping | **yes** |
-| `RLIMIT_CPU` (default: the wall limit, in CPU seconds) and `RLIMIT_FSIZE` (default 1 GB per file), inherited by every child | a busy loop; any file growing without bound, including deleted-but-open ones | **yes**, even for a process that leaves the group |
-| Disk floor: refuses below `--min-free-gb` (default 50), stops below `--abort-free-gb` (default 20) | filling the disk | no |
+| A watchdog inside the group. It ignores every catchable signal, kills the group at the deadline + 11 s, brings that forward to 6 s once the runner starts stopping, and enforces the disk floor. | the incident: the runner gone, the group still looping | **yes** |
+| Escapees, tracked two ways by both the runner and the watchdog. **Descendants:** every process descended from the group, polled twice a second. **Run tag:** `BOUNDED_RUN_ID` in the environment. | processes that left the group (`setsid`, `start_new_session=True`, `process_group=0`, job control) | **yes** |
+| `RLIMIT_FSIZE` (default 1 GB per file), inherited by every child | any file growing without bound, including deleted-but-open ones like the incident's | **yes** |
+| `RLIMIT_CPU` (default: wall + 16 CPU-seconds per process) | a pure computation loop | **yes**, but on macOS **not** a loop that makes a system call each pass (writes, sleeps, clock reads), and macOS does not enforce the hard CPU limit |
+| Disk floor: refuses below `--min-free-gb` (default 50), stops below `--abort-free-gb` (default 20) | filling the disk | **yes** (the watchdog checks it too) |
 
-Exit status: the command's own; **124** at the deadline; **125** at the disk floor; **128+N** for death by signal N (152 = SIGXCPU, the CPU limit; 153 = SIGXFSZ, the file-size limit). The end of the log is printed, and a summary line on stderr counts stragglers killed and survivors. **Any survivor is a bug: report it.**
+**Exit status:**
+- the command's own status;
+- **124**: the deadline;
+- **125**: the disk floor;
+- **128+N**: death by signal N:
+  - 152 = SIGXCPU (the CPU limit);
+  - 153 = SIGXFSZ (the file-size limit, for non-Python commands; a Python command's writes fail with EFBIG instead);
+  - 137 = SIGKILL (for example, the watchdog firing while the runner was stopped).
+
+The end of the log is printed, and a summary line on stderr counts stragglers killed, escapees killed and survivors. **Any survivor is a bug: report it.** Do not pipe the runner through `tail` or similar, because that loses its exit status. Read the summary line and the status.
 
 ## Choosing bounds
 
-- One test-suite run: `--wall` about 3× its normal duration. tally's full suite takes about 2 minutes, so 600.
-- One mutant: `--wall 300`. A hang is then a result (124), and the process is gone.
-- Nested runs keep the tighter of the inherited and requested limits. A run can never loosen its parent's.
-- Parallel workers: **2 by default**. Each full repo copy plus its environment costs about 0.5–1 GB, and the disk floor applies per run.
+- **One test-suite run:** `--wall` about 3× its normal duration. tally's full suite takes about 2 minutes, so 600.
+- **One mutant:** `--wall 300`. A hang is then a result, and the process is gone.
+- **Nested runs** keep the tighter of the inherited and requested limits. A run can never loosen its parent's.
+- **Never wrap the runner** in another timeout shorter than `--wall` + 25 s. That kills the runner, not the command; the watchdog still bounds the command, but you lose the report.
+- **Parallel workers: 2 by default.** Each full repo copy plus its environment costs about 0.5–1 GB, and the disk floor applies per run.
+- **125 (refused or stopped at the floor):** report it. Never lower the floor to get past it.
+- **Threads:** `RLIMIT_CPU` counts every thread of a process, so a healthy multithreaded process can reach 152 before the wall. Raise `--cpu` for it explicitly.
 
 ## Mutation runners
 
-A runner that loops over mutants calls `bounded_run.py` for each one: a subprocess per mutant, with `--wall`. It reads the status: 124 is a hang, so **TIMEOUT, never KILLED**. Restore the file from a backup copy in a `finally`, never with `git checkout`, which discards your uncommitted edits.
+A runner that loops over mutants calls `bounded_run.py` for each one: a subprocess per mutant, with `--wall`. It reads the status:
+- **124, 137 or 152 is a TIMEOUT (a hang), never KILLED.**
+- A collection error is INDETERMINATE.
 
-Tests that prove a loop ends need their own bound as well: pytest-timeout, or an iteration cap in the fake. Then a mutant that removes the loop's exit fails instead of hanging.
+Mutate a **copy** in your own scratch directory, never a file someone else may be running. Restore from a backup copy in a `finally`, never with `git checkout`, which discards your uncommitted edits.
+
+Tests that prove a loop ends need their own bound as well: pytest-timeout in **thread** mode, or an iteration cap in the fake. Then a mutant that removes the loop's exit fails instead of hanging. The default signal mode cannot stop a loop running in a worker thread.
 
 ## Before handing work back
 
@@ -49,14 +68,17 @@ Tests that prove a loop ends need their own bound as well: pytest-timeout, or an
 python3 ~/.agents/skills/bounded-run/bounded_run.py --check
 ```
 
-This exits 1 and lists every registered run that still has a live process. Run it before you report. If anything is listed, it is yours: say so in your report, with its pid and command. Never report "done" with a process of yours still running. A reported "hang" or "timeout" is a process to account for, not a fact about code.
+This exits 1 and lists every run of **your owner** (`BOUNDED_RUN_OWNER`) that still has a live process. Run it before you report:
+- If anything is listed, say so in your report, with its pid and command.
+- Never report "done" with a process of yours still running.
+- A reported "hang" or "timeout" is a process to account for, not a fact about code.
 
-Coordinators run it, and `ps -axo pid,etime,command | grep pytest`, after every agent stops.
+Coordinators run `--check --all` and `ps -axo pid,etime,command | grep pytest` after every agent stops.
 
 ## Limits of the tool
 
-- A process that starts its own session (`setsid`, `start_new_session=True`) leaves the group. It still carries the CPU and file-size limits, but the watchdog and `--check` cannot see it. Bound such children yourself.
-- `RLIMIT_CPU` counts CPU time per process. A process that sleeps forever is not stopped by it. Only the group kill and the watchdog stop it, and those hold only while it stays in the group.
-- Logs go to the registry (default `$TMPDIR/bounded-run/`), are capped by the file-size limit, and are pruned after 7 days.
+- **The escapee poll can miss a process.** If a parent starts a detached child and exits between two polls (0.5 s), descendant tracking misses that child. The run tag still finds it if it is not an Apple system binary: on macOS, `ps` shows the environment of Homebrew Python and similar binaries, but not of `/bin/bash` or `/bin/sleep`.
+- **A process that clears its environment and detaches within that window is not tracked.** It still carries the file-size limit, and the CPU limit for pure computation.
+- **Logs** go to the registry (default `$TMPDIR/bounded-run/`). They are capped by the file-size limit, and only this tool's own logs are pruned, after 7 days.
 
-Tests: `test_bounded_run.py` proves each bound against a real misbehaving process. Run it with `bounded_run.py --wall 180 -- python -m pytest test_bounded_run.py`.
+Tests: `test_bounded_run.py` proves each bound against a real misbehaving process. Run it with `bounded_run.py --wall 400 -- python -m pytest test_bounded_run.py`, using a previous, known-good copy of the runner as the outer bound when changing the runner itself.

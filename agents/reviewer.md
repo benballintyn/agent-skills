@@ -40,18 +40,22 @@ be earned — every PR reviewed under this process so far had a real finding.
      mutation as killed);
    - **confirm each patch applied** (an unmatched pattern reports "survived");
    - run **every** test run and mutant through
-     `python3 ~/.agents/skills/bounded-run/bounded_run.py --wall 300 -- …`,
-     never a bare `subprocess.run(timeout=…)`: that kills one process, and on
-     2026-10-09 an orphan under a hung test wrote ~335 GB and filled the
-     owner's disk. A status of 124 is a TIMEOUT (a hang), never "killed";
+     `python3 ~/.agents/skills/bounded-run/bounded_run.py --wall <S> -- …`
+     with `BOUNDED_RUN_OWNER` set to your scratch directory (`--wall` about 3×
+     a suite's normal duration; 300 for one mutant), never a bare
+     `subprocess.run(timeout=…)`: that kills one process, and on 2026-10-09
+     an orphan under a hung test wrote ~335 GB and filled the owner's disk.
+     A status of 124, 137 or 152 is a TIMEOUT (a hang), never "killed";
+     mutate a **copy** in your scratch directory, never a file others run;
    - run with `PYTHONDONTWRITEBYTECODE=1` **and purge `__pycache__` after each
      restore** (a same-size mutant restored within the same second leaves
      stale bytecode that the next run executes);
    - restore the file from a backup copy after every mutant (never with
      `git checkout`, which also discards uncommitted work); `git status` must
      be clean at the end. Report each mutation: line, change, caught/survived;
-   - before reporting, run `bounded_run.py --check`: nothing you started may
-     still be running, and anything listed goes in your report with its pid.
+   - before reporting, run `bounded_run.py --check` (same owner): nothing
+     you started may still be running, and anything listed goes in your
+     report with its pid.
 6. Classify every finding by **reachability today**, and say which it is:
    - **BLOCKER** — wrong behaviour a user or caller will hit against the
      current server, contract and shipped clients (data loss, a paid action
