@@ -201,14 +201,33 @@ def test_stragglers_left_behind_by_a_finished_command_are_killed_and_counted(tmp
 
     assert result.returncode == 0
     assert "1 straggler(s) killed" in result.stderr and "0 survivor(s)" in result.stderr
+    assert f"bounded-run: straggler {read_pids(pid_file)[0]}: sleep 30" in result.stderr
     assert not alive(read_pids(pid_file)[0])
 
 
-def test_a_hang_reports_124_not_the_cpu_limit_at_the_default_cpu_bound(tmp_path: Path) -> None:
-    """With the default CPU limit (wall + 16 s) a busy hang is a timeout (124), not a 152."""
-    result = run_tool("--wall", "3", "--", sys.executable, "-c", "while True: pass", registry=tmp_path)
+def test_a_renamed_copy_knows_its_own_watchdog(tmp_path: Path) -> None:
+    """An outer bound pinned to a copy under another name counts no straggler and waits no grace."""
+    copy = tmp_path / "runner-pinned.py"
+    copy.write_text(SCRIPT.read_text())
+    started = time.monotonic()
 
-    assert result.returncode == bounded_run.EXIT_TIMEOUT, result.stderr
+    result = subprocess.run([sys.executable, str(copy), "--registry", str(tmp_path / "reg"), *NO_FLOOR,
+                             "--wall", "20", "--", "true"], capture_output=True, text=True, timeout=60, env=env())
+
+    assert result.returncode == 0
+    assert "0 straggler(s) killed" in result.stderr, result.stderr
+    assert time.monotonic() - started < bounded_run.GRACE_S, "the TERM grace was not cut short"
+
+
+def test_a_hang_reports_124_not_the_cpu_limit_at_the_default_cpu_bound(tmp_path: Path) -> None:
+    """With the default CPU limit (wall + 16 s) a busy hang is a timeout (124), not a 152.
+
+    Three trials: with the old default (the wall) a busy hang gave 152 in 3 of 5.
+    """
+    statuses = [run_tool("--wall", "3", "--", sys.executable, "-c", "while True: pass",
+                         registry=tmp_path).returncode for _ in range(3)]
+
+    assert statuses == [bounded_run.EXIT_TIMEOUT] * 3
 
 
 # --- the watchdog: the incident's path ---------------------------------------------------
@@ -237,7 +256,7 @@ def test_the_watchdog_kills_the_whole_group_at_the_fixed_slack_after_the_runner_
             "the watchdog did not kill the leader and the grandchild"
         )
     finally:
-        kill_quietly(pgids=(runner.pid,), pids=tuple(read_pids(pids)))
+        kill_quietly(pgids=(runner.pid, *read_pids(pids)), pids=tuple(read_pids(pids)))
 
 
 def test_a_term_ignoring_command_dies_when_the_runner_is_terminated_then_killed_mid_grace(
@@ -259,13 +278,15 @@ def test_a_term_ignoring_command_dies_when_the_runner_is_terminated_then_killed_
             "a TERM-ignoring command outlived a runner killed mid-grace"
         )
     finally:
-        kill_quietly(pgids=(runner.pid,), pids=tuple(read_pids(pid_file)))
+        kill_quietly(pgids=(runner.pid, *read_pids(pid_file)), pids=tuple(read_pids(pid_file)))
 
 
 def test_a_command_that_signals_its_own_group_cannot_disarm_the_watchdog(tmp_path: Path) -> None:
-    """``kill -INT 0`` / ``kill -TERM 0`` from the command reaches the watchdog, which ignores it."""
+    """Every catchable signal the command sends its own group reaches the watchdog, which ignores it."""
     pid_file = tmp_path / "pid"
-    script = (f"trap '' INT TERM; echo $$ > {pid_file}; kill -INT 0; kill -TERM 0; "
+    signals = "INT TERM HUP QUIT USR1 USR2 ALRM PROF VTALRM XCPU ABRT TSTP TTIN TTOU"
+    sends = "; ".join(f"kill -{name} 0" for name in signals.split())
+    script = (f"trap '' {signals}; echo $$ > {pid_file}; {sends}; "
               "for i in $(seq 1 300); do sleep 0.2; done")
     runner = start_tool("--wall", "2", "--", "bash", "-c", script, registry=tmp_path)
     try:
@@ -277,7 +298,7 @@ def test_a_command_that_signals_its_own_group_cannot_disarm_the_watchdog(tmp_pat
 
         assert wait_until(lambda: not alive(command), 2 + EXPECTED_SLACK_S + 6)
     finally:
-        kill_quietly(pgids=(runner.pid,), pids=tuple(read_pids(pid_file)))
+        kill_quietly(pgids=(runner.pid, *read_pids(pid_file)), pids=tuple(read_pids(pid_file)))
 
 
 def test_terminating_the_runner_stops_the_command_and_exits_143(tmp_path: Path) -> None:
@@ -294,7 +315,7 @@ def test_terminating_the_runner_stops_the_command_and_exits_143(tmp_path: Path) 
         assert code == 128 + signal.SIGTERM
         assert not alive(command)
     finally:
-        kill_quietly(pgids=(runner.pid,), pids=tuple(read_pids(pid_file)))
+        kill_quietly(pgids=(runner.pid, *read_pids(pid_file)), pids=tuple(read_pids(pid_file)))
 
 
 def test_the_watchdog_enforces_the_disk_floor_without_the_runner(tmp_path: Path) -> None:
@@ -313,7 +334,7 @@ def test_the_watchdog_enforces_the_disk_floor_without_the_runner(tmp_path: Path)
 
         assert wait_until(lambda: not alive(command), 5), "the watchdog ignored the disk floor"
     finally:
-        kill_quietly(pgids=(runner.pid,), pids=tuple(read_pids(pid_file)))
+        kill_quietly(pgids=(runner.pid, *read_pids(pid_file)), pids=tuple(read_pids(pid_file)))
 
 
 # --- processes that leave the group ------------------------------------------------------
@@ -374,7 +395,7 @@ def test_the_watchdog_kills_an_escapee_after_the_runner_is_killed(tmp_path: Path
 
         assert wait_until(lambda: not alive(escapee), 2 + EXPECTED_SLACK_S + 6), "the escapee outlived the watchdog"
     finally:
-        kill_quietly(pgids=(runner.pid,), pids=tuple(read_pids(pid_file)))
+        kill_quietly(pgids=(runner.pid, *read_pids(pid_file)), pids=tuple(read_pids(pid_file)))
 
 
 # --- kernel limits -----------------------------------------------------------------------
@@ -446,6 +467,18 @@ def test_the_disk_floor_refuses_to_start_the_command(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_a_disk_floor_stop_reports_125_even_when_the_watchdog_sees_it_first(tmp_path: Path) -> None:
+    """The watchdog checks the floor within milliseconds of the start, the runner at 0.5 s:
+    whichever stops the run, the status is 125, never a 137 that reads as a hang."""
+    statuses = [
+        subprocess.run(tool("--min-free-gb", "0", "--abort-free-gb", "1e12", "--wall", "20", "--", "sleep", "10",
+                            registry=tmp_path), capture_output=True, text=True, timeout=60, env=env()).returncode
+        for _ in range(3)
+    ]
+
+    assert statuses == [bounded_run.EXIT_DISK] * 3
+
+
 def test_falling_below_the_abort_floor_stops_a_running_command(tmp_path: Path, mocker) -> None:
     """Free space measured by the runner while the command runs stops it: status 125."""
     readings = iter([100.0] + [1.0] * 1000)
@@ -498,6 +531,28 @@ def test_check_reports_only_the_callers_own_runs_unless_asked_for_all(tmp_path: 
     assert after.returncode == 0
 
 
+def test_check_without_an_owner_set_checks_every_run_and_says_so(tmp_path: Path) -> None:
+    """An agent whose export did not survive to its --check call must not get a false all-clear."""
+    unset = {k: v for k, v in os.environ.items() if k != "BOUNDED_RUN_OWNER"}
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    runner = subprocess.Popen(tool(*NO_FLOOR, "--wall", "6", "--", "sleep", "30", registry=tmp_path),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                              env=unset)
+    groups: list[int] = []
+    try:
+        assert wait_until(lambda: bool(list(tmp_path.glob("*.json"))), 10)
+        groups = [record_of(tmp_path)["pid"]]
+        result = subprocess.run([sys.executable, str(SCRIPT), "--registry", str(tmp_path), "--check"],
+                                capture_output=True, text=True, timeout=30, env=unset, cwd=elsewhere)
+        runner.wait(timeout=30)
+    finally:
+        kill_quietly(pgids=(runner.pid, *groups))
+
+    assert result.returncode == 1 and "LIVE" in result.stdout, result.stdout
+    assert "is not set" in result.stdout and "checking every owner" in result.stdout
+
+
 def test_check_skips_a_partial_record(tmp_path: Path) -> None:
     """A half-written record is skipped, not a crash."""
     (tmp_path / "20260101T000000-0123abcd.json").write_text('{"run_id": "x", "own')
@@ -544,24 +599,37 @@ def test_a_record_names_the_owner_group_command_and_deadline(tmp_path: Path) -> 
     assert not list(tmp_path.glob("*.json"))
 
 
+def test_the_tracker_never_takes_a_reused_pid_for_a_known_descendant(mocker) -> None:
+    """A pid seen earlier but now belonging to another process (another start time) is not killed."""
+    tables = iter([
+        {100: (1, 100, "Thu Oct  9 10:00:00 2026"), 101: (100, 100, "Thu Oct  9 10:00:01 2026")},
+        {101: (1, 101, "Thu Oct  9 10:05:00 2026"), 102: (1, 102, "Thu Oct  9 10:00:02 2026")},
+    ])
+    mocker.patch.object(bounded_run, "process_table", side_effect=lambda: next(tables))
+    tracker = bounded_run.Tracker(100)
+    tracker.update()
+
+    assert tracker.escapees() == [], "pid 101 was reused by an unrelated process"
+
+
 def test_pruning_deletes_only_this_tools_own_old_logs(tmp_path: Path) -> None:
     """A foreign *.log in the registry is never touched, however old."""
-    ours = tmp_path / "20200101T000000-0123abcd.log"
+    ours = [tmp_path / f"20200101T000000-0123abcd{suffix}" for suffix in (".log", ".stopping", ".disk")]
     theirs = tmp_path / "build.log"
-    for path in (ours, theirs):
+    for path in (*ours, theirs):
         path.write_text("x")
         os.utime(path, (0, 0))
 
     bounded_run.prune_logs(tmp_path)
 
-    assert not ours.exists() and theirs.exists()
+    assert not any(path.exists() for path in ours) and theirs.exists()
 
 
 @pytest.mark.parametrize("wall", ["inf", "nan", "0", "-1"])
-def test_a_wall_limit_that_is_not_finite_and_positive_is_refused(wall: str) -> None:
-    """``--wall inf`` would leave no deadline at all."""
+def test_a_wall_limit_that_is_not_finite_and_positive_is_refused(wall: str, tmp_path: Path) -> None:
+    """``--wall inf`` would leave no deadline at all. (A scratch registry: a broken guard runs only ``true``.)"""
     with pytest.raises(SystemExit):
-        bounded_run.main(["--wall", wall, "--", "true"])
+        bounded_run.main(["--registry", str(tmp_path), "--wall", wall, "--", "true"])
 
 
 def test_without_a_command_the_tool_refuses() -> None:

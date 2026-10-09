@@ -86,8 +86,9 @@ ENV_RUN_ID = "BOUNDED_RUN_ID"
 ENV_OWNER = "BOUNDED_RUN_OWNER"
 RUN_ID = re.compile(r"\A\d{8}T\d{6}-[0-9a-f]{8}\Z")
 DEFAULT_REGISTRY = Path(os.environ.get("BOUNDED_RUN_REGISTRY", Path(tempfile.gettempdir()) / "bounded-run"))
-WATCHDOG_IGNORES = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1,
-                    signal.SIGUSR2, signal.SIGALRM, signal.SIGPIPE)
+# Every signal the watchdog can ignore: all but SIGKILL and SIGSTOP (which cannot be
+# caught) and SIGCHLD (left as it is).
+WATCHDOG_IGNORES = tuple(sorted(signal.valid_signals() - {signal.SIGKILL, signal.SIGSTOP, signal.SIGCHLD}))
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,15 @@ class Record:
     started: float
     deadline: float
     log: str
+
+
+def owner_from_env() -> str | None:
+    """Return ``BOUNDED_RUN_OWNER``, or None when it is unset or empty.
+
+    Returns:
+        The owner, if set.
+    """
+    return os.environ.get(ENV_OWNER) or None
 
 
 def default_owner() -> str:
@@ -303,19 +313,23 @@ class Tracker:
                 if pid in table and table[pid][2] == start and table[pid][1] != self.pgid and pid != os.getpid()]
 
 
-def is_watchdog(command: str) -> bool:
-    """Say whether a process is this tool's own watchdog (the forked, never-exec'd child).
+def is_watchdog(command: str, run_id: str) -> bool:
+    """Say whether a process is this run's watchdog (the forked, never-exec'd child).
+
+    Known by the run id in its command line, not by this file's name, so a renamed
+    copy of the tool (an outer bound pinned to a previous version) still knows it.
 
     Args:
         command: The process's command line.
+        run_id: The run's id.
 
     Returns:
-        True for the watchdog.
+        True for this run's watchdog.
     """
-    return "bounded_run.py --_child" in command
+    return "--_child" in command and run_id in command
 
 
-def kill_group(pgid: int) -> None:
+def kill_group(pgid: int, run_id: str) -> None:
     """Terminate a process group, then kill whatever is left after a grace period.
 
     The watchdog ignores ``SIGTERM`` by design; once only it is left, the grace
@@ -323,16 +337,19 @@ def kill_group(pgid: int) -> None:
 
     Args:
         pgid: The process group id.
+        run_id: The run's id, to recognise its watchdog.
     """
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(pgid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS answers EPERM when only an unreaped (zombie) leader is left: there
+            # is nothing alive to signal, as with ESRCH.
             return
         deadline = time.monotonic() + GRACE_S
         while time.monotonic() < deadline:
             members = group_members(pgid)
-            if not members or (sig == signal.SIGTERM and all(is_watchdog(c) for c in members.values())):
+            if not members or (sig == signal.SIGTERM and all(is_watchdog(c, run_id) for c in members.values())):
                 break
             time.sleep(0.1)
 
@@ -379,7 +396,8 @@ def watchdog(config: dict[str, Any]) -> None:
         config: The child configuration (deadline, run id, stop file, paths, floor).
     """
     for sig in WATCHDOG_IGNORES:
-        signal.signal(sig, signal.SIG_IGN)
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(sig, signal.SIG_IGN)
     tracker = Tracker(os.getpgrp())
     try:
         deadline = config["deadline"] + WATCHDOG_SLACK_S
@@ -390,6 +408,7 @@ def watchdog(config: dict[str, Any]) -> None:
             if stop_file.exists():
                 deadline = min(deadline, time.time() + GRACE_S + 1)
             if lowest_free_gb(paths) < config["abort_free_gb"]:
+                Path(config["disk_file"]).touch()
                 break
             time.sleep(WATCHDOG_POLL_S)
     except BaseException:  # noqa: BLE001  (fail closed: any failure ends in the kill below)
@@ -432,18 +451,19 @@ def child_main(config: dict[str, Any], command: list[str]) -> None:
 
 
 def prune_logs(registry: Path) -> None:
-    """Delete this tool's own logs (named by run id) older than the retention period.
+    """Delete this tool's own logs and marker files (named by run id) past the retention period.
 
     Args:
         registry: The registry directory.
     """
     cutoff = time.time() - LOG_RETENTION_S
-    for log in registry.glob("*.log"):
-        if not RUN_ID.match(log.stem):
-            continue
-        with contextlib.suppress(FileNotFoundError):
-            if log.stat().st_mtime < cutoff:
-                log.unlink()
+    for pattern in ("*.log", "*.stopping", "*.disk"):
+        for path in registry.glob(pattern):
+            if not RUN_ID.match(path.stem):
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
 
 
 def write_atomically(path: Path, text: str) -> None:
@@ -456,6 +476,32 @@ def write_atomically(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text)
     os.replace(tmp, path)
+
+
+def wait_for(proc: subprocess.Popen[bytes], deadline: float, paths: list[Path], limits: Limits,
+             tracker: Tracker) -> str:
+    """Wait until the command exits, the deadline passes, or the disk floor is reached.
+
+    Args:
+        proc: The command's process.
+        deadline: Unix time of the wall-clock deadline.
+        paths: The filesystems to watch.
+        limits: The run's limits (for the abort floor).
+        tracker: Updated on every poll, so escapees are remembered.
+
+    Returns:
+        ``"exited"``, ``"timeout"`` or ``"disk"``.
+    """
+    while True:
+        tracker.update()
+        try:
+            proc.wait(timeout=POLL_S)
+            return "exited"
+        except subprocess.TimeoutExpired:
+            if time.time() >= deadline:
+                return "timeout"
+            if lowest_free_gb(paths) < limits.abort_free_gb:
+                return "disk"
 
 
 def run(limits: Limits, command: list[str], registry: Path, log: Path | None, tail_kb: int,
@@ -488,8 +534,10 @@ def run(limits: Limits, command: list[str], registry: Path, log: Path | None, ta
     started = time.time()
     deadline = started + limits.wall_s
     stop_file = registry / f"{run_id}.stopping"
+    disk_file = registry / f"{run_id}.disk"
     config = {"limits": asdict(limits), "deadline": deadline, "run_id": run_id, "stop_file": str(stop_file),
-              "paths": [str(p) for p in paths], "abort_free_gb": limits.abort_free_gb}
+              "disk_file": str(disk_file), "paths": [str(p) for p in paths],
+              "abort_free_gb": limits.abort_free_gb}
     env = {**os.environ, ENV_RUN_ID: run_id, ENV_OWNER: owner}
     child = [sys.executable, os.path.abspath(__file__), "--_child", json.dumps(config), "--", *command]
     with open(log, "wb") as out:
@@ -504,7 +552,7 @@ def run(limits: Limits, command: list[str], registry: Path, log: Path | None, ta
     def stop() -> None:
         with contextlib.suppress(OSError):
             stop_file.touch()
-        kill_group(pgid)
+        kill_group(pgid, run_id)
 
     def on_signal(signum: int, frame: FrameType | None) -> None:
         stop()
@@ -513,19 +561,17 @@ def run(limits: Limits, command: list[str], registry: Path, log: Path | None, ta
     previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
     tracker = Tracker(pgid)
     try:
-        outcome = None
-        while outcome is None:
-            tracker.update()
-            try:
-                proc.wait(timeout=POLL_S)
-                outcome = "exited"
-            except subprocess.TimeoutExpired:
-                if time.time() >= deadline:
-                    outcome = "timeout"
-                elif lowest_free_gb(paths) < limits.abort_free_gb:
-                    outcome = "disk"
+        try:
+            outcome = wait_for(proc, deadline, paths, limits, tracker)
+        except BaseException:
+            stop()
+            raise
+        if disk_file.exists():
+            outcome = "disk"  # the watchdog saw the floor first
         tracker.update()
-        stragglers = [pid for pid, cmd in group_members(pgid).items() if pid != pgid and not is_watchdog(cmd)]
+        straggling = {pid: cmd for pid, cmd in group_members(pgid).items()
+                      if pid != pgid and not is_watchdog(cmd, run_id)}
+        stragglers = sorted(straggling)
         stop()
         proc.wait()
         escaped = sorted(set(tracker.escapees()) | set(tagged_processes(run_id)))
@@ -536,6 +582,7 @@ def run(limits: Limits, command: list[str], registry: Path, log: Path | None, ta
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         stop_file.unlink(missing_ok=True)
+        disk_file.unlink(missing_ok=True)
         record_path.unlink(missing_ok=True)
 
     with open(log, "rb") as fh:
@@ -547,6 +594,8 @@ def run(limits: Limits, command: list[str], registry: Path, log: Path | None, ta
     print(f"bounded-run: {outcome}; status {status}; {time.time() - started:.1f}s; "
           f"{len(stragglers)} straggler(s) killed; {len(escaped)} escaped process(es) killed; "
           f"{len(survivors)} survivor(s); log {log}", file=sys.stderr)
+    for pid, cmd in straggling.items():
+        print(f"bounded-run: straggler {pid}: {cmd[:160]}", file=sys.stderr)
     if survivors:
         print(f"bounded-run: WARNING: processes {survivors} survived the kill", file=sys.stderr)
     return status
@@ -585,8 +634,9 @@ def check(registry: Path, owner: str, everyone: bool) -> int:
             print(f"LIVE{overdue} {record.run_id} owner={record.owner!r} pgid={record.pid} "
                   f"members={sorted(set(members) | set(tagged))} cmd={' '.join(record.command)[:120]!r} "
                   f"log={record.log}")
-        elif record.owner == owner:
-            path.unlink(missing_ok=True)
+        elif record.owner == owner or everyone:
+            for stale in (path, path.with_suffix(".stopping"), path.with_suffix(".disk")):
+                stale.unlink(missing_ok=True)
     if not alive:
         print("bounded-run: no live runs")
     return 1 if alive else 0
@@ -618,7 +668,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
     args = parser.parse_args(argv)
     if args.check:
-        return check(args.registry, default_owner(), args.all)
+        owner = owner_from_env()
+        if owner is None and not args.all:
+            print(f"bounded-run: {ENV_OWNER} is not set on this command, so checking every run "
+                  "(set it on the same command line as the runs to check only yours)")
+        everyone = args.all or owner is None
+        print(f"bounded-run: checking {'every owner' if everyone else repr(owner)}")
+        return check(args.registry, owner or default_owner(), everyone)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give a command after --")
