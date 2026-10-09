@@ -192,7 +192,25 @@ def ps_lines(fields: str) -> list[str]:
     # restore_signals=False: the watchdog ignores SIGXFSZ and SIGPIPE, and so must
     # its ps, or one sent to the group kills ps and the watchdog fails closed.
     return subprocess.run(["ps", "-A", "-o", fields], capture_output=True, text=True,
-                          check=True, restore_signals=False).stdout.splitlines()
+                          check=True, restore_signals=False).stdout.split("\n")
+
+
+def numeric(fields: list[str], count: int) -> bool:
+    """Say whether the first ``count`` fields of a ``ps`` line are numbers.
+
+    A process whose command line holds a newline (a multi-line ``sh -c`` script, a
+    ``python -c`` program) spills onto extra lines of ``ps`` output that start with
+    its text, not a pid. Those lines are skipped, never parsed, so one such process
+    anywhere on the machine cannot crash the runner or make the watchdog fail closed.
+
+    Args:
+        fields: The line, split on whitespace.
+        count: How many leading fields must be numbers.
+
+    Returns:
+        True when the line can be read.
+    """
+    return len(fields) > count and all(field.lstrip("-").isdigit() for field in fields[:count])
 
 
 def group_members(pgid: int) -> dict[int, str]:
@@ -207,7 +225,7 @@ def group_members(pgid: int) -> dict[int, str]:
     members = {}
     for line in ps_lines("pid=,pgid=,stat=,command="):
         fields = line.split(None, 3)
-        if len(fields) >= 3 and int(fields[1]) == pgid and not fields[2].startswith("Z"):
+        if numeric(fields, 2) and int(fields[1]) == pgid and not fields[2].startswith("Z"):
             members[int(fields[0])] = fields[3] if len(fields) == 4 else ""
     return members
 
@@ -251,9 +269,9 @@ def tagged_processes(run_id: str) -> list[int]:
         listing = subprocess.run(["ps", "-E", "-A", "-o", "pid=,stat=,command="], capture_output=True,
                                  text=True, restore_signals=False).stdout
         pattern = re.compile(rf"(^|\s){re.escape(tag)}(\s|$)")
-        for line in listing.splitlines():
+        for line in listing.split("\n"):
             fields = line.split(None, 2)
-            if len(fields) == 3 and not fields[1].startswith("Z") and pattern.search(fields[2]):
+            if numeric(fields, 1) and len(fields) == 3 and not fields[1].startswith("Z") and pattern.search(fields[2]):
                 found.append(int(fields[0]))
     return [pid for pid in found if pid != os.getpid()]
 
@@ -267,7 +285,7 @@ def process_table() -> dict[int, tuple[int, int, str]]:
     table = {}
     for line in ps_lines("pid=,ppid=,pgid=,stat=,lstart="):
         fields = line.split(None, 4)
-        if len(fields) == 5 and not fields[3].startswith("Z"):
+        if numeric(fields, 3) and len(fields) == 5 and not fields[3].startswith("Z"):
             table[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[4].strip())
     return table
 
@@ -569,18 +587,22 @@ def run(limits: Limits, command: list[str], registry: Path, log: Path | None, ta
         except BaseException:
             stop()
             raise
-        if disk_file.exists():
-            outcome = "disk"  # the watchdog saw the floor first
-        tracker.update()
-        straggling = {pid: cmd for pid, cmd in group_members(pgid).items()
-                      if pid != pgid and not is_watchdog(cmd, run_id)}
-        stragglers = sorted(straggling)
-        stop()
-        proc.wait()
-        escaped = sorted(set(tracker.escapees()) | set(tagged_processes(run_id)))
-        kill_pids(escaped)
-        time.sleep(0.2 if escaped else 0)
-        survivors = sorted(set(group_members(pgid)) | set(tracker.escapees()) | set(tagged_processes(run_id)))
+        try:
+            if disk_file.exists():
+                outcome = "disk"  # the watchdog saw the floor first
+            tracker.update()
+            straggling = {pid: cmd for pid, cmd in group_members(pgid).items()
+                          if pid != pgid and not is_watchdog(cmd, run_id)}
+            stragglers = sorted(straggling)
+            stop()
+            proc.wait()
+            escaped = sorted(set(tracker.escapees()) | set(tagged_processes(run_id)))
+            kill_pids(escaped)
+            time.sleep(0.2 if escaped else 0)
+            survivors = sorted(set(group_members(pgid)) | set(tracker.escapees()) | set(tagged_processes(run_id)))
+        except BaseException:
+            stop()  # whatever failed after the command ended, its group still goes
+            raise
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
