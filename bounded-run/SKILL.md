@@ -72,7 +72,7 @@ This exits 1 and lists every run of **your owner** that still has a live process
 - Never report "done" with a process of yours still running.
 - A reported "hang" or "timeout" is a process to account for, not a fact about code.
 
-Coordinators run `--check --all` and `ps -axo pid,etime,command | grep pytest` after every agent stops.
+Coordinators run `--check --all` and `/bin/ps -axo pid,etime,command | grep pytest` after every agent stops. Write `/bin/ps`, not `ps`: an output-filtering hook (rtk) rewrites a bare `ps` and keeps only its first 30 lines, so the grep printed nothing while pytest processes were live (2026-10-15).
 
 ## Limits of the tool
 
